@@ -1,0 +1,71 @@
+services:
+  oci-waiter:
+    image: python:3.12-slim
+    restart: unless-stopped
+    volumes:
+      - ociwaiter-data:/data
+    env_file:
+      - .env
+    command:
+      - bash
+      - -lc
+      - |
+          set -e
+
+          if [ -f /data/success.lock ]; then
+            echo "Already succeeded. Exiting."
+            exit 0
+          fi
+
+          echo "oci-waiter start: $(date -Is)"
+
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            openssh-client ca-certificates >/dev/null
+          rm -rf /var/lib/apt/lists/*
+
+          python -m pip install -U pip oci-cli >/dev/null
+
+          mkdir -p /root/.oci
+          printf "%s\n" "$OCI_API_KEY_PEM" > /root/.oci/oci_api_key.pem
+          chmod 600 /root/.oci/oci_api_key.pem
+
+          cat > /root/.oci/config <<EOF
+          [DEFAULT]
+          user=${OCI_CLI_USER}
+          fingerprint=${OCI_CLI_FINGERPRINT}
+          tenancy=${OCI_CLI_TENANCY}
+          region=${OCI_CLI_REGION}
+          key_file=/root/.oci/oci_api_key.pem
+          EOF
+          chmod 600 /root/.oci/config
+          export SUPPRESS_LABEL_WARNING=True
+
+          mkdir -p /data/ssh
+          if [ ! -f /data/ssh/id_ed25519 ]; then
+            ssh-keygen -t ed25519 -N "" -f /data/ssh/id_ed25519
+          fi
+          SSH_PUB_KEY="$(cat /data/ssh/id_ed25519.pub)"
+
+          while true; do
+            date -Is
+            oci compute instance launch \
+              --region "$OCI_CLI_REGION" \
+              --availability-domain "$AVAILABILITY_DOMAIN" \
+              --compartment-id "$COMPARTMENT_ID" \
+              --subnet-id "$SUBNET_ID" \
+              --image-id "$IMAGE_ID" \
+              --shape "$SHAPE" \
+              --shape-config "{\"ocpus\":${SHAPE_OCPUS},\"memoryInGBs\":${SHAPE_MEMORY_GB}}" \
+              --display-name "$DISPLAY_NAME" \
+              --metadata "{\"ssh_authorized_keys\":\"$SSH_PUB_KEY\"}" \
+              --wait-for-state RUNNING && break
+
+            echo "retry in 5 minutes"
+            sleep 300
+          done
+
+          touch /data/success.lock
+
+volumes:
+  ociwaiter-data: {}
